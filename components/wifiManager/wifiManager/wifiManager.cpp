@@ -1,53 +1,73 @@
 #include "wifiManager.hpp"
 #include "fec.h"
+#include "stream_protocol.h"
+#include "esp_heap_caps.h"
+#include "esp_now.h"
+#include "usb_cdc_serial.h"
 #include <new>
+
+static bool s_espnow_ready = false;
+static const uint8_t s_bcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+// Feedback is rebuilt at 1 Hz but rebroadcast ~5x/s so the camera's
+// duty-cycled receiver (300ms wake window per second) catches a copy.
+static sp_feedback_t s_fb_cached;
+static bool s_fb_valid = false;
 
 static auto WIFI_MANAGER_TAG = "[WIFI_MANAGER]";
 
-//Start Receiver Vars
-#define MAX_CHUNKS 512
-#define VENDOR_OUI          {0xAC,0xDE,0x47}
-static const uint8_t vendor_oui[3] = VENDOR_OUI;
-#define MAX_PAYLOAD_SIZE 350
-#define MAX_FRAME_SIZE (50*1024)
-#define UART_PORT UART_NUM_0
+// ---------------------------------------------------------------------------
+// 802.11 stream receiver (protocol v2, see stream_protocol.h)
+//
+// The sniffer fills one of two PSRAM slabs. When every RS block of a frame
+// has >= k chunks, the slab is handed to the decode task by pointer (no
+// copy) and filling continues in the other slab. Slabs are sized for the
+// protocol maxima, so TX-side geometry changes never need a resize. A slab
+// is fully reset on every new frame_id — chunks of different frames are
+// never mixed.
+// ---------------------------------------------------------------------------
 
-// Custom EtherType
-#define CUSTOM_ETHERTYPE 0x88B5
+#define RX_FRAME_STALE_MS 200
 
-// RS(4,4) FEC parameters (must match TXStream)
-#define FEC_RS_DATA_CHUNKS   4
-#define FEC_RS_PARITY_CHUNKS 4
-#define FEC_RS_TOTAL_CHUNKS  8
-#define FEC_MAX_RS_BLOCKS    16
+typedef struct {
+    volatile bool busy;        // owned by the decode task
+    bool     active;           // currently accumulating a frame
+    uint8_t  frame_id;
+    uint8_t  k, n, num_blocks;
+    uint16_t payload_len;
+    uint32_t frame_len;
+    uint8_t  blocks_ready;     // blocks with >= k chunks
+    uint8_t  chunk_present[SP_BLOCKS_MAX][SP_N_MAX];
+    uint8_t  block_have[SP_BLOCKS_MAX];
+    int32_t  rssi_sum;
+    uint32_t chunks_rx;
+    uint32_t t_first_ms;
+    uint8_t *buf;              // SP_BLOCKS_MAX * SP_N_MAX * SP_PAYLOAD_MAX (PSRAM)
+} rx_slab_t;
 
-static uint8_t frame_buf[MAX_FRAME_SIZE];
-static uint8_t current_frame_id = 0xFF;
-static uint8_t expected_chunks = 0;
-static uint8_t received_chunks = 0;
-static uint8_t chunk_map[MAX_CHUNKS / 8];
-static uint32_t frame_start_time = 0;
+static rx_slab_t s_slab[2];
+static int s_fill = 0;                 // slab being filled, -1 = none free
+static int s_last_completed_id = -1;   // suppresses late chunks of a delivered frame
 
-// Per-RS-block decode state
-static uint8_t rs_block_received[FEC_MAX_RS_BLOCKS][FEC_RS_TOTAL_CHUNKS];
-static uint8_t rs_block_count = 0;
-static uint8_t frame_decoded = 0;  // Flag to prevent repeated decode of same frame
+static uint8_t *s_decoded = nullptr;   // SP_BLOCKS_MAX * SP_K_MAX * SP_PAYLOAD_MAX (PSRAM)
+static QueueHandle_t s_decode_q = nullptr;
 
-// Decode snapshot buffers (protect against next frame overwriting during decode)
-// The sniffer snapshots frame_buf + rs_block_received here before signaling decode.
-// The decode task copies from these under mutex, so the sniffer can move on to the next frame.
-static uint8_t decode_buf[MAX_FRAME_SIZE];
-static uint8_t decode_rs_block_received[FEC_MAX_RS_BLOCKS][FEC_RS_TOTAL_CHUNKS];
-static uint8_t decode_rs_block_count;
-static SemaphoreHandle_t decode_mutex = NULL;
-
-// Decode task: semaphore + handle
-static SemaphoreHandle_t rs_decode_semaphore = nullptr;
-static TaskHandle_t rs_decode_task_handle = nullptr;
+// Receive statistics, printed at 1 Hz by the decode task
+typedef struct {
+    uint32_t frames_decoded;
+    uint32_t frames_incomplete;  // abandoned: next frame started or stale
+    uint32_t chunks_stored;      // on completed frames
+    uint32_t chunks_expected;    // on completed frames
+    uint32_t chunks_late;        // chunks of an already-delivered frame
+    uint32_t chunks_nofill;      // dropped because both slabs were busy
+    uint32_t blocks_repaired;    // blocks that needed parity reconstruction
+    uint32_t bad_jpeg;
+    int64_t  rssi_sum;
+    uint32_t rssi_cnt;
+} rx_stats_t;
+static rx_stats_t s_st;
 
 static JpegFrameCallback g_jpegFrameCallback = nullptr;
-
-//End Receiver Vars
 
 void WiFiManagerHelpers::event_handler(void *arg, esp_event_base_t event_base,
                                        int32_t event_id, void *event_data)
@@ -205,100 +225,23 @@ void WiFiManager::SetupAccessPoint()
   ESP_LOGI(WIFI_MANAGER_TAG, "AP started.");
 }
 
-static fec_t* s_fec = nullptr;
+static fec_t  *s_fec = nullptr;
+static uint8_t s_fec_k = 0, s_fec_n = 0;
 
-static bool rs_decode_block(
-    const uint8_t* block_data,
-    const uint8_t* block_received,
-    uint8_t* out,
-    size_t* outLen)
+static bool ensure_rx_fec(uint8_t k, uint8_t n)
 {
-    // Count present chunks
-    uint8_t totalPresent = 0;
-    uint8_t dataPresent = 0;
-    for (uint8_t c = 0; c < FEC_RS_DATA_CHUNKS; c++) {
-        if (block_received[c]) { totalPresent++; dataPresent++; }
-    }
-    for (uint8_t p = 0; p < FEC_RS_PARITY_CHUNKS; p++) {
-        if (block_received[FEC_RS_DATA_CHUNKS + p]) totalPresent++;
-    }
-
-    if (totalPresent < FEC_RS_DATA_CHUNKS) return false;
-
-    // All data present — fast copy
-    if (dataPresent == FEC_RS_DATA_CHUNKS) {
-        memcpy(out, block_data, FEC_RS_DATA_CHUNKS * MAX_PAYLOAD_SIZE);
-        *outLen = FEC_RS_DATA_CHUNKS * MAX_PAYLOAD_SIZE;
+    if (s_fec && s_fec_k == k && s_fec_n == n) {
         return true;
     }
-
-    // Arrange k received chunks for zfec: primary data at natural slots,
-    // secondary parity filling holes for missing data.
-    const gf* inpkts[FEC_RS_DATA_CHUNKS];
-    unsigned index[FEC_RS_DATA_CHUNKS];
-
-    uint8_t nextSecondary = 0;
-    for (uint8_t c = 0; c < FEC_RS_DATA_CHUNKS; c++) {
-        if (block_received[c]) {
-            inpkts[c] = block_data + c * MAX_PAYLOAD_SIZE;
-            index[c] = c;
-        } else {
-            while (nextSecondary < FEC_RS_PARITY_CHUNKS &&
-                   !block_received[FEC_RS_DATA_CHUNKS + nextSecondary])
-                nextSecondary++;
-            if (nextSecondary >= FEC_RS_PARITY_CHUNKS) return false;
-            uint8_t secIdx = FEC_RS_DATA_CHUNKS + nextSecondary;
-            inpkts[c] = block_data + secIdx * MAX_PAYLOAD_SIZE;
-            index[c] = secIdx;
-            nextSecondary++;
-        }
+    if (s_fec) {
+        fec_free(s_fec);
+        s_fec = nullptr;
     }
-
-    // Temporary space for reconstructed missing data chunks
-    uint8_t* reconstructed = new (std::nothrow) uint8_t[FEC_RS_DATA_CHUNKS * MAX_PAYLOAD_SIZE];
-    if (!reconstructed) return false;
-    memset(reconstructed, 0, FEC_RS_DATA_CHUNKS * MAX_PAYLOAD_SIZE);
-
-    gf* outpkts[FEC_RS_DATA_CHUNKS];
-    for (uint8_t i = 0; i < FEC_RS_DATA_CHUNKS; i++)
-        outpkts[i] = reconstructed + i * MAX_PAYLOAD_SIZE;
-
-    fec_decode(s_fec, inpkts, outpkts, index, MAX_PAYLOAD_SIZE);
-
-    // Copy: present data from block_data, reconstructed from outpkts
-    uint8_t outix = 0;
-    for (uint8_t c = 0; c < FEC_RS_DATA_CHUNKS; c++) {
-        if (block_received[c]) {
-            memcpy(out + c * MAX_PAYLOAD_SIZE, block_data + c * MAX_PAYLOAD_SIZE, MAX_PAYLOAD_SIZE);
-        } else {
-            memcpy(out + c * MAX_PAYLOAD_SIZE, outpkts[outix], MAX_PAYLOAD_SIZE);
-            outix++;
-        }
-    }
-
-    delete[] reconstructed;
-    *outLen = FEC_RS_DATA_CHUNKS * MAX_PAYLOAD_SIZE;
-    return true;
-}
-
-// Check if enough chunks have been received in an RS block for decode.
-// RS(4,4) can correct up to 4 known erasures — any 4 of the 8 chunks suffice.
-static inline bool rs_block_decodable(uint8_t blockId)
-{
-    uint8_t totalPresent = 0;
-    for (uint8_t c = 0; c < FEC_RS_TOTAL_CHUNKS; c++) {
-        if (rs_block_received[blockId][c]) totalPresent++;
-    }
-    return totalPresent >= FEC_RS_DATA_CHUNKS;
-}
-
-// Check if all RS blocks for the current frame are decodable
-static inline bool all_rs_blocks_decodable()
-{
-    for (uint8_t b = 0; b < rs_block_count; b++) {
-        if (!rs_block_decodable(b)) return false;
-    }
-    return true;
+    init_fec();
+    s_fec = fec_new(k, n);
+    s_fec_k = k;
+    s_fec_n = n;
+    return s_fec != nullptr;
 }
 
 void WiFiManager::setJpegFrameCallback(JpegFrameCallback callback) {
@@ -306,194 +249,249 @@ void WiFiManager::setJpegFrameCallback(JpegFrameCallback callback) {
 }
 
 // ---------------------------------------------------------------------------
-// RS decode task: runs on dedicated core, offloaded from WiFi task.
-// Waits on semaphore, copies snapshot from decode_buf under mutex,
-// decodes frame, calls JPEG callback.
+// Decode task: receives a completed slab by index, reconstructs missing data
+// chunks per RS block, trims to the frame length from the header and hands
+// the JPEG to the callback. Also prints receive statistics at 1 Hz.
 // ---------------------------------------------------------------------------
 static void rs_decode_task_fn(void* arg)
 {
-    // Pre-allocate local buffer on heap (45KB can't live on 4KB stack)
-    uint8_t* local_frame_buf = new (std::nothrow) uint8_t[MAX_FRAME_SIZE];
-    uint8_t local_rs_block_received[FEC_MAX_RS_BLOCKS][FEC_RS_TOTAL_CHUNKS];
-    if (!local_frame_buf) {
-        ESP_LOGE(WIFI_MANAGER_TAG, "Failed to allocate decode local buffer");
-        return;
-    }
+    (void)arg;
+    int64_t last_log = esp_timer_get_time();
+    int64_t last_fb_send = 0;
 
     while (true) {
-        if (xSemaphoreTake(rs_decode_semaphore, portMAX_DELAY) != pdTRUE) continue;
+        int idx;
+        bool got = xQueueReceive(s_decode_q, &idx, pdMS_TO_TICKS(250)) == pdTRUE;
 
-        // Copy snapshot from decode_buf under mutex protection
-        // This prevents the sniffer from writing decode_buf while we read it.
-        xSemaphoreTake(decode_mutex, portMAX_DELAY);
-        memcpy(local_frame_buf, decode_buf, MAX_FRAME_SIZE);
-        memcpy(local_rs_block_received, decode_rs_block_received, sizeof(local_rs_block_received));
-        uint8_t block_count = decode_rs_block_count;
-        xSemaphoreGive(decode_mutex);
-
-        uint8_t* decoded = new (std::nothrow) uint8_t[FEC_MAX_RS_BLOCKS * FEC_RS_DATA_CHUNKS * MAX_PAYLOAD_SIZE];
-        if (!decoded) continue;
-        memset(decoded, 0, FEC_MAX_RS_BLOCKS * FEC_RS_DATA_CHUNKS * MAX_PAYLOAD_SIZE);
-
-        size_t totalDecodedLen = 0;
-        bool decodeOk = true;
-
-        for (uint8_t b = 0; b < block_count; b++) {
-            size_t blockLen = 0;
-            const uint8_t* block_data = local_frame_buf + b * FEC_RS_TOTAL_CHUNKS * MAX_PAYLOAD_SIZE;
-            if (!rs_decode_block(block_data, local_rs_block_received[b], decoded + totalDecodedLen, &blockLen)) {
-                decodeOk = false;
-                break;
+        // Rebroadcast the cached feedback ~5x/s for the camera's wake window
+        if (s_espnow_ready && s_fb_valid) {
+            int64_t t = esp_timer_get_time();
+            if (t - last_fb_send >= 190000) {
+                last_fb_send = t;
+                esp_now_send(s_bcast_mac, (const uint8_t *)&s_fb_cached, sizeof(s_fb_cached));
             }
-            totalDecodedLen += blockLen;
         }
 
-        if (decodeOk) {
-            // Find JPEG end marker
-            size_t total_length = 0;
-            for (size_t i = totalDecodedLen - 1; i >= 1; i--) {
-                if (decoded[i-1] == 0xFF && decoded[i] == 0xD9) {
-                    total_length = i + 1;
-                    break;
+        if (got) {
+            rx_slab_t *s = &s_slab[idx];
+            const uint8_t  k = s->k, n = s->n;
+            const uint16_t payload = s->payload_len;
+            bool ok = ensure_rx_fec(k, n);
+
+            for (uint8_t b = 0; ok && b < s->num_blocks; b++) {
+                uint8_t *out_base = s_decoded + (size_t)b * k * payload;
+                const uint8_t *blk = s->buf + (size_t)b * n * payload;
+
+                bool all_data = true;
+                for (uint8_t c = 0; c < k; c++) {
+                    if (!s->chunk_present[b][c]) { all_data = false; break; }
+                }
+
+                if (all_data) {
+                    // data chunks 0..k-1 are a contiguous prefix of the block
+                    memcpy(out_base, blk, (size_t)k * payload);
+                    continue;
+                }
+
+                s_st.blocks_repaired++;
+
+                // Primary chunks at their natural slots, parity filling holes
+                const gf *in[SP_K_MAX];
+                unsigned  index[SP_K_MAX];
+                gf       *outp[SP_K_MAX];
+                uint8_t   outix = 0;
+                uint8_t   next_par = k;
+
+                for (uint8_t c = 0; c < k; c++) {
+                    if (s->chunk_present[b][c]) {
+                        in[c] = blk + (size_t)c * payload;
+                        index[c] = c;
+                        memcpy(out_base + (size_t)c * payload, in[c], payload);
+                    } else {
+                        while (next_par < n && !s->chunk_present[b][next_par]) next_par++;
+                        // guaranteed by blocks_ready: >= k chunks present
+                        in[c] = blk + (size_t)next_par * payload;
+                        index[c] = next_par;
+                        outp[outix++] = out_base + (size_t)c * payload;
+                        next_par++;
+                    }
+                }
+                fec_decode(s_fec, in, outp, index, payload);
+            }
+
+            if (ok) {
+                uint32_t cap = (uint32_t)s->num_blocks * k * payload;
+                uint32_t flen = s->frame_len;
+                if (flen == 0 || flen > cap) flen = cap;
+
+                if (s_decoded[0] != 0xFF || s_decoded[1] != 0xD8) {
+                    s_st.bad_jpeg++;
+                }
+                s_st.frames_decoded++;
+
+                if (g_jpegFrameCallback) {
+                    g_jpegFrameCallback(s_decoded, flen);
                 }
             }
-            if (total_length == 0) total_length = totalDecodedLen;
-
-            ESP_LOGI(WIFI_MANAGER_TAG, "RS decode OK: %zu bytes, JPEG end at %zu, blocks=%d",
-                     totalDecodedLen, total_length, block_count);
-            ESP_LOGI(WIFI_MANAGER_TAG, "JPEG header: 0x%02X%02X%02X%02X",
-                     decoded[0], decoded[1], decoded[2], decoded[3]);
-
-            if (g_jpegFrameCallback) {
-                g_jpegFrameCallback(decoded, total_length);
-            }
-        } else {
-            ESP_LOGW(WIFI_MANAGER_TAG, "RS decode FAILED: blocks=%d", block_count);
+            s->busy = false; // release slab back to the sniffer
         }
 
-        delete[] decoded;
+        // USB liveness watchdog: a wedged TinyUSB task doesn't panic on its
+        // own, so force a coredump (captures all task backtraces) when the
+        // heartbeat stalls for 5 seconds.
+        static uint32_t last_hb = 0;
+        static uint8_t  hb_stalled = 0;
+        int64_t now = esp_timer_get_time();
+        if (now - last_log >= 1000000) {
+            if (usb_cdc_active()) {
+                uint32_t hb = g_tud_task_heartbeat;
+                if (hb == last_hb) {
+                    if (++hb_stalled >= 5) {
+                        ESP_LOGE(WIFI_MANAGER_TAG, "TinyUSB task wedged (heartbeat stalled 5s) — aborting for coredump");
+                        abort();
+                    }
+                } else {
+                    hb_stalled = 0;
+                }
+                last_hb = hb;
+            }
+            // Frames complete before their tail chunks arrive (interleaved
+            // order), so stragglers counted in chunks_late are received too.
+            uint32_t loss_pm = 0; // permille
+            if (s_st.chunks_expected) {
+                uint32_t received = s_st.chunks_stored + s_st.chunks_late;
+                if (received > s_st.chunks_expected) received = s_st.chunks_expected;
+                loss_pm = (uint32_t)(1000ULL * (s_st.chunks_expected - received) / s_st.chunks_expected);
+            }
+            int rssi = s_st.rssi_cnt ? (int)(s_st.rssi_sum / (int64_t)s_st.rssi_cnt) : 0;
+
+            // Refresh the cached link-quality feedback snapshot. It is
+            // re-broadcast ~5x/second (below) so the camera's duty-cycled
+            // receiver catches at least one copy per wake window.
+            {
+                uint32_t received = s_st.chunks_stored + s_st.chunks_late;
+                s_fb_cached.magic[0] = 'O';
+                s_fb_cached.magic[1] = 'I';
+                s_fb_cached.version  = SP_FEEDBACK_VERSION;
+                s_fb_cached.rssi_avg = (int8_t)rssi;
+                s_fb_cached.chunks_expected   = (uint16_t)(s_st.chunks_expected > 0xFFFF ? 0xFFFF : s_st.chunks_expected);
+                s_fb_cached.chunks_received   = (uint16_t)(received > 0xFFFF ? 0xFFFF : received);
+                s_fb_cached.blocks_repaired   = (uint16_t)(s_st.blocks_repaired > 0xFFFF ? 0xFFFF : s_st.blocks_repaired);
+                s_fb_cached.frames_decoded    = (uint8_t)(s_st.frames_decoded > 0xFF ? 0xFF : s_st.frames_decoded);
+                s_fb_cached.frames_incomplete = (uint8_t)(s_st.frames_incomplete > 0xFF ? 0xFF : s_st.frames_incomplete);
+                s_fb_valid = true;
+            }
+            ESP_LOGI(WIFI_MANAGER_TAG,
+                     "rx: %lu fps, loss %lu.%lu%%, repaired %lu blk, incomplete %lu, late %lu, nofill %lu, badjpeg %lu, rssi %d",
+                     (unsigned long)s_st.frames_decoded,
+                     (unsigned long)(loss_pm / 10), (unsigned long)(loss_pm % 10),
+                     (unsigned long)s_st.blocks_repaired,
+                     (unsigned long)s_st.frames_incomplete,
+                     (unsigned long)s_st.chunks_late,
+                     (unsigned long)s_st.chunks_nofill,
+                     (unsigned long)s_st.bad_jpeg,
+                     rssi);
+            memset(&s_st, 0, sizeof(s_st));
+            last_log = now;
+        }
     }
 }
 
-// Updated sniffer callback for data packets with RS(8,4) FEC
+// ---------------------------------------------------------------------------
+// Promiscuous sniffer: validates v2 chunks, accumulates them into the fill
+// slab and hands completed frames to the decode task.
+// ---------------------------------------------------------------------------
+static void slab_begin_frame(rx_slab_t *s, const sp_parsed_t *p, uint32_t now_ms)
+{
+    s->active      = true;
+    s->frame_id    = p->hdr->frame_id;
+    s->k           = p->k;
+    s->n           = p->n;
+    s->num_blocks  = p->hdr->num_blocks;
+    s->payload_len = p->chunk_len;
+    s->frame_len   = p->frame_len;
+    s->blocks_ready = 0;
+    s->rssi_sum    = 0;
+    s->chunks_rx   = 0;
+    s->t_first_ms  = now_ms;
+    memset(s->chunk_present, 0, sizeof(s->chunk_present));
+    memset(s->block_have, 0, sizeof(s->block_have));
+}
+
 static void sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t t)
 {
+    (void)t;
     const wifi_promiscuous_pkt_t *ppkt = (wifi_promiscuous_pkt_t *)buf;
-    const uint8_t *payload = ppkt->payload;
+    if (ppkt->rx_ctrl.rx_state != 0) return; // reception error
 
-    // Check if it's a regular data frame (frame control = 0x08, not 0x88)
-    if ((payload[0] & 0xFC) != 0x08) return;
+    sp_parsed_t p;
+    if (!sp_parse_frame(ppkt->payload, ppkt->rx_ctrl.sig_len, &p)) return;
 
-    // Skip to LLC/SNAP header (after 802.11 header)
-    const uint8_t *llc_snap = payload + 24;
-
-    // Verify LLC/SNAP header for our custom protocol
-    if (llc_snap[0] != 0xAA || llc_snap[1] != 0xAA || llc_snap[2] != 0x03) return;
-    if (llc_snap[3] != 0x00 || llc_snap[4] != 0x00 || llc_snap[5] != 0x00) return;
-
-    // Check our custom EtherType
-    uint16_t ethertype = (llc_snap[6] << 8) | llc_snap[7];
-    if (ethertype != CUSTOM_ETHERTYPE) return;
-
-    // Parse our custom header (11 bytes with FEC fields)
-    const uint8_t *custom_hdr = llc_snap + 8;
-
-    // Verify OUI
-    if (memcmp(custom_hdr, vendor_oui, 3) != 0) return;
-
-    uint8_t frame_id = custom_hdr[3];
-    uint8_t rs_block_id = custom_hdr[4];
-    uint8_t chunk_id = custom_hdr[5];
-    uint8_t total_chunks = custom_hdr[6];
-    uint8_t chunk_type = custom_hdr[7]; (void)chunk_type;
-    uint16_t chunk_len = (custom_hdr[8] << 8) | custom_hdr[9];
-
-    const uint8_t *jpeg_data = custom_hdr + 10;
-
-    // Validate chunk length
-    int max_possible_len = ppkt->rx_ctrl.sig_len - (jpeg_data - payload);
-    if (chunk_len > max_possible_len || chunk_len > MAX_PAYLOAD_SIZE) {
-        return;
+    // (Re)claim a fill slab if the last completion left us without one
+    if (s_fill < 0) {
+        if (!s_slab[0].busy)      s_fill = 0;
+        else if (!s_slab[1].busy) s_fill = 1;
+        else { s_st.chunks_nofill++; return; }
+        s_slab[s_fill].active = false;
     }
+    rx_slab_t *s = &s_slab[s_fill];
 
-    // Validate RS block ID
-    if (rs_block_id >= FEC_MAX_RS_BLOCKS) {
-        return;
-    }
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
 
-    // Handle new frame
-    if (frame_id != current_frame_id) {
-        current_frame_id = frame_id;
-        expected_chunks = total_chunks;
-        received_chunks = 0;
-        rs_block_count = 0;
-        frame_decoded = 0;
-        memset(frame_buf, 0, sizeof(frame_buf));
-        memset(chunk_map, 0, sizeof(chunk_map));
-        memset(rs_block_received, 0, sizeof(rs_block_received));
-        frame_start_time = esp_timer_get_time() / 1000; // ms
-    }
-
-    // Frame timeout: if no new chunk arrives within 120ms, give up and reset
-    // This prevents getting stuck on incomplete frames during interference
-    {
-        int32_t elapsed = esp_timer_get_time() / 1000 - frame_start_time;
-        if (elapsed > 120) {
-            ESP_LOGW(WIFI_MANAGER_TAG, "Frame %d timeout after %ld ms (received %d chunks)",
-                     current_frame_id, (long)elapsed, received_chunks);
-            current_frame_id = 0xFF;
-            frame_decoded = 0;
-            rs_block_count = 0;
-            received_chunks = 0;
-            memset(rs_block_received, 0, sizeof(rs_block_received));
-            // Update start time so this chunk is treated as the start of a fresh attempt
-            frame_start_time = esp_timer_get_time() / 1000;
+    if (s->active) {
+        bool same = (s->frame_id == p.hdr->frame_id) &&
+                    (s->k == p.k) && (s->n == p.n) &&
+                    (s->num_blocks == p.hdr->num_blocks) &&
+                    (s->payload_len == p.chunk_len) &&
+                    (s->frame_len == p.frame_len);
+        if (!same || (now_ms - s->t_first_ms > RX_FRAME_STALE_MS)) {
+            // A new frame began or accumulation went stale (frame_id wrap /
+            // TX restart). The old frame is abandoned whole — its chunks are
+            // never attached to the new frame.
+            if (s->chunks_rx) s_st.frames_incomplete++;
+            s->active = false;
         }
     }
 
-    // Process chunk
-    if (chunk_id < FEC_RS_TOTAL_CHUNKS) {
-        if (!rs_block_received[rs_block_id][chunk_id]) {
-            rs_block_received[rs_block_id][chunk_id] = 1;
+    if (!s->active) {
+        if ((int)p.hdr->frame_id == s_last_completed_id) {
+            s_st.chunks_late++; // straggler of a frame already delivered
+            return;
+        }
+        slab_begin_frame(s, &p, now_ms);
+    }
 
-            // Calculate offset in frame buffer
-            size_t offset = (rs_block_id * FEC_RS_TOTAL_CHUNKS + chunk_id) * MAX_PAYLOAD_SIZE;
-            if (offset + chunk_len <= MAX_FRAME_SIZE) {
-                memcpy(frame_buf + offset, jpeg_data, chunk_len);
-                received_chunks++;
+    const uint8_t b = p.hdr->rs_block_id;
+    const uint8_t c = p.hdr->chunk_id;
+    if (s->chunk_present[b][c]) return;          // duplicate
+    s->chunk_present[b][c] = 1;
+    s->chunks_rx++;
+    s->rssi_sum += ppkt->rx_ctrl.rssi;
 
-                // Track RS block count
-                if (rs_block_id + 1 > rs_block_count)
-                    rs_block_count = rs_block_id + 1;
-            } else {
-                // Frame buffer overflow prevented - silent fail
-            }
+    if (s->block_have[b] < s->k) {               // block still needs chunks
+        memcpy(s->buf + ((size_t)b * s->n + c) * s->payload_len, p.payload, s->payload_len);
+        if (++s->block_have[b] == s->k) {
+            s->blocks_ready++;
         }
     }
 
-    // Signal decode task when frame is ready (only once per frame).
-    // Must have all blocks decodable AND all expected RS blocks accounted for.
-    // expected_chunks = numRsBlocks * FEC_RS_TOTAL_CHUNKS (from TX header),
-    // so expected_rs_blocks = expected_chunks / FEC_RS_TOTAL_CHUNKS.
-    // This guard prevents triggering on partial multi-block frames before
-    // later blocks' data has arrived.
-    if (!frame_decoded && all_rs_blocks_decodable() &&
-        rs_block_count >= expected_chunks / FEC_RS_TOTAL_CHUNKS) {
-        frame_decoded = 1;
+    if (s->blocks_ready >= s->num_blocks) {
+        // Frame complete — hand this slab off, continue in the other one
+        s->busy = true;
+        s->active = false;
+        s_last_completed_id = s->frame_id;
+        s_st.chunks_stored   += s->chunks_rx;
+        s_st.chunks_expected += (uint32_t)s->num_blocks * s->n;
+        s_st.rssi_sum += s->rssi_sum;
+        s_st.rssi_cnt += s->chunks_rx;
 
-        // Snapshot frame state into decode buffers under mutex.
-        // The decode task copies from these snapshots, so it can safely
-        // decode even if the sniffer has moved on to the next frame.
-        if (xSemaphoreTake(decode_mutex, 0) == pdTRUE) {
-            memcpy(decode_buf, frame_buf, sizeof(decode_buf));
-            memcpy(decode_rs_block_received, rs_block_received, sizeof(decode_rs_block_received));
-            decode_rs_block_count = rs_block_count;
-            xSemaphoreGive(decode_mutex);
+        int done = s_fill;
+        int other = 1 - s_fill;
+        s_fill = s_slab[other].busy ? -1 : other;
+        if (s_fill >= 0) {
+            s_slab[s_fill].active = false;
         }
-
-        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-        xSemaphoreGiveFromISR(rs_decode_semaphore, &xHigherPriorityTaskWoken);
-        if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+        xQueueSend(s_decode_q, &done, 0);
     }
 }
 
@@ -505,9 +503,34 @@ void WiFiManager::Begin()
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_wifi_init(&cfg);
     esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_err_t err = esp_wifi_config_80211_tx_rate(WIFI_IF_STA,  WIFI_PHY_RATE_9M); //WIFI_PHY_RATE_2M_L
+    esp_err_t err = esp_wifi_config_80211_tx_rate(WIFI_IF_STA,  WIFI_PHY_RATE_54M); //WIFI_PHY_RATE_2M_L
     esp_wifi_start();
     esp_wifi_set_channel(CONFIG_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+
+    // Receive the dongle's link-quality feedback (drives rate/parity/power
+    // adaptation in TXStream; absent feedback = static defaults).
+    //
+    // NOTE: do NOT enable modem power save / ESP-NOW wake windows here. It
+    // was tried (WIFI_PS_MIN_MODEM + 300ms/1s wake window) and the sleep
+    // transitions mangled the injected stream: chunk loss rose ~10x at the
+    // same RSSI. At 67fps the radio transmits every ~15ms, so there is no
+    // idle to harvest anyway — the receiver must stay on while streaming.
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    if (esp_now_init() == ESP_OK) {
+        esp_now_register_recv_cb([](const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+            (void)info;
+            if (len == (int)sizeof(sp_feedback_t)) {
+                const sp_feedback_t *fb = (const sp_feedback_t *)data;
+                if (fb->magic[0] == 'O' && fb->magic[1] == 'I' && fb->version == SP_FEEDBACK_VERSION) {
+                    txstream_feedback(fb);
+                }
+            }
+        });
+        ESP_LOGI(WIFI_MANAGER_TAG, "Feedback receiver ready (ESP-NOW)");
+    } else {
+        ESP_LOGW(WIFI_MANAGER_TAG, "ESP-NOW init failed - adaptation disabled, using static defaults");
+    }
+
     ESP_LOGI(WIFI_MANAGER_TAG, "TX started on channel %d", CONFIG_WIFI_CHANNEL);
   #endif
 
@@ -516,8 +539,11 @@ void WiFiManager::Begin()
     esp_netif_init();
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_wifi_init(&cfg);
-    esp_wifi_set_mode(WIFI_MODE_NULL);
+    // STA (unconnected) instead of NULL so ESP-NOW can transmit feedback;
+    // promiscuous reception works the same in STA mode.
+    esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_start();
+    esp_wifi_set_ps(WIFI_PS_NONE);
     esp_wifi_set_channel(CONFIG_WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
         // Configure promiscuous filter to only receive data packets
     wifi_promiscuous_filter_t filter = {
@@ -527,16 +553,39 @@ void WiFiManager::Begin()
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous_rx_cb(sniffer_cb));
     esp_wifi_set_promiscuous(true);
 
-    // Initialize zfec FEC library
-    if (!s_fec) {
-        init_fec();
-        s_fec = fec_new(FEC_RS_DATA_CHUNKS, FEC_RS_TOTAL_CHUNKS);
+    // Receive slabs and decode output live in PSRAM, sized for the protocol
+    // maxima so runtime FEC geometry changes never need a resize.
+    const size_t slab_sz = (size_t)SP_BLOCKS_MAX * SP_N_MAX * SP_PAYLOAD_MAX;
+    for (int i = 0; i < 2; i++) {
+        s_slab[i].buf = (uint8_t *)heap_caps_malloc(slab_sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    s_decoded = (uint8_t *)heap_caps_malloc((size_t)SP_BLOCKS_MAX * SP_K_MAX * SP_PAYLOAD_MAX,
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_slab[0].buf || !s_slab[1].buf || !s_decoded) {
+        ESP_LOGE(WIFI_MANAGER_TAG, "Failed to allocate RX stream buffers in PSRAM");
+        return;
     }
 
-    // Create RS decode task (offloaded from WiFi task to prevent heap corruption)
-    rs_decode_semaphore = xSemaphoreCreateBinary();
-    decode_mutex = xSemaphoreCreateMutex();
-    xTaskCreatePinnedToCore(rs_decode_task_fn, "rs_decode", 4096, nullptr, 5, &rs_decode_task_handle, 1);
+    ensure_rx_fec(SP_K_DEFAULT, SP_N_DEFAULT);
+
+    // ESP-NOW feedback channel back to the camera (broadcast, 1 Hz)
+    if (esp_now_init() == ESP_OK) {
+        esp_now_peer_info_t peer = {};
+        memcpy(peer.peer_addr, s_bcast_mac, 6);
+        peer.channel = 0; // current channel
+        peer.ifidx   = WIFI_IF_STA;
+        peer.encrypt = false;
+        if (esp_now_add_peer(&peer) == ESP_OK) {
+            s_espnow_ready = true;
+            ESP_LOGI(WIFI_MANAGER_TAG, "Feedback channel ready (ESP-NOW broadcast)");
+        }
+    }
+    if (!s_espnow_ready) {
+        ESP_LOGW(WIFI_MANAGER_TAG, "ESP-NOW init failed - running without feedback (camera uses defaults)");
+    }
+
+    s_decode_q = xQueueCreate(2, sizeof(int));
+    xTaskCreatePinnedToCore(rs_decode_task_fn, "rs_decode", 4096, nullptr, 5, nullptr, 1);
 
     ESP_LOGI(WIFI_MANAGER_TAG, "RX started on channel %d", CONFIG_WIFI_CHANNEL);
   #endif

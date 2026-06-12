@@ -39,10 +39,14 @@ namespace UVCStreamHelpers
     size_t len;
   } jpeg_fb_t;
 
-  static jpeg_fb_t jpeg_s_fb;
-  static bool stream_active;
-  static SemaphoreHandle_t frame_ready_sem;
-  static uint8_t uvc_frame_buf[75 * 1024];
+  // Preallocated in PSRAM by UVCStreamManager::setup():
+  // jpeg_pp[2] is a ping-pong pair filled by provide_jpeg_frame (writers flip
+  // jpeg_front after the copy); uvc_frame_buf is the stable copy handed to
+  // the UVC stack. Definitions live in UVCStream.cpp.
+  extern jpeg_fb_t jpeg_pp[2];
+  extern volatile int jpeg_front;
+  extern SemaphoreHandle_t frame_ready_sem;
+  extern uint8_t *uvc_frame_buf;
   #endif
 
   static esp_err_t camera_start_cb(uvc_format_t format, int width, int height, int rate, void *cb_ctx);

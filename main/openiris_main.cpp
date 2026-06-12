@@ -9,6 +9,7 @@
 #include "nvs_flash.h"
 
 #include <openiris_logo.hpp>
+#include <usb_cdc_serial.h>
 #include <wifiManager.hpp>
 #include <ProjectConfig.hpp>
 #include <StateManager.hpp>
@@ -190,6 +191,10 @@ extern "C" void app_main(void)
     // setup CI and building for other boards
     // finish todos, overhaul stuff a bit
 
+    // Buffer console output for replay on the CDC port (UVC builds) — must
+    // run before the logo and startup logs so they get captured.
+    usb_cdc_console_mirror_init();
+
     Logo::printASCII();
     initNVSStorage();
 
@@ -229,7 +234,7 @@ extern "C" void app_main(void)
         serialManagerHandle);
 
     #ifdef CONFIG_RX_MODE
-    wifiManager.setJpegFrameCallback([&](uint8_t* frameBuffer, uint16_t length) {
+    wifiManager.setJpegFrameCallback([&](uint8_t* frameBuffer, size_t length) {
         uvcStream.provide_jpeg_frame(frameBuffer, length);
     });
     ESP_LOGI("[MAIN]", "Set WiFi Manger jpeg callback");

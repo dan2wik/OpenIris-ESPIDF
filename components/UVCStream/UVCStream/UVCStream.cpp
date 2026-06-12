@@ -1,4 +1,5 @@
 #include "UVCStream.hpp"
+#include "esp_heap_caps.h"
 constexpr int UVC_MAX_FRAMESIZE_SIZE(75 * 1024);
 
 static const char *UVC_STREAM_TAG = "[UVC DEVICE]";
@@ -7,6 +8,14 @@ namespace UVCStreamHelpers
 {
   uint16_t frameWidth = 0;
   uint16_t frameHeight = 0;
+
+  #ifdef CONFIG_RX_MODE
+  // All frame buffers live in PSRAM (allocated once in setup()); see hpp.
+  jpeg_fb_t jpeg_pp[2] = {};
+  volatile int jpeg_front = 0;
+  SemaphoreHandle_t frame_ready_sem = nullptr;
+  uint8_t *uvc_frame_buf = nullptr;
+  #endif
 }
 
 static esp_err_t UVCStreamHelpers::camera_start_cb(uvc_format_t format, int width, int height, int rate, void *cb_ctx)
@@ -67,7 +76,6 @@ static void UVCStreamHelpers::camera_stop_cb(void *cb_ctx)
 
 static uvc_fb_t *UVCStreamHelpers::camera_fb_get_cb(void *cb_ctx)
 {
-  ESP_LOGW(UVC_STREAM_TAG, "FB_CB");
   (void)cb_ctx;
   #ifndef CONFIG_RX_MODE
   s_fb.cam_fb_p = esp_camera_fb_get();
@@ -95,20 +103,21 @@ static uvc_fb_t *UVCStreamHelpers::camera_fb_get_cb(void *cb_ctx)
     // Frame already decoded — take immediately
     xSemaphoreTake(frame_ready_sem, 0);
   }
-  // Get Self Contained jpeg frame here
-  if (jpeg_s_fb.buf == nullptr || jpeg_s_fb.len == 0) {
-    ESP_LOGW(UVC_STREAM_TAG, "FB_CB: buffer null or zero length");
+  // Snapshot the front (stable) ping-pong buffer; provide_jpeg_frame only
+  // ever writes the back buffer, then flips.
+  const int front = jpeg_front;
+  const size_t flen = jpeg_pp[front].len;
+  if (jpeg_pp[front].buf == nullptr || flen == 0) {
+    ESP_LOGW(UVC_STREAM_TAG, "FB_CB: no frame available");
     return nullptr;
   }
-  // Copy to static buffer to prevent corruption from concurrent provide_jpeg_frame
-  memcpy(uvc_frame_buf, jpeg_s_fb.buf, jpeg_s_fb.len);
+  memcpy(uvc_frame_buf, jpeg_pp[front].buf, flen);
   s_fb.uvc_fb.buf = uvc_frame_buf;
-  s_fb.uvc_fb.len = jpeg_s_fb.len;
+  s_fb.uvc_fb.len = flen;
   s_fb.uvc_fb.width = frameWidth;
   s_fb.uvc_fb.height = frameHeight;
   s_fb.uvc_fb.format = UVC_FORMAT_JPEG; // we gotta make sure we're ALWAYS using JPEG
   s_fb.uvc_fb.timestamp = static_cast<timeval>(esp_timer_get_time());
-  ESP_LOGI(UVC_STREAM_TAG, "FB_CB: frame captured %zu bytes, buf=%p", jpeg_s_fb.len, (void*)uvc_frame_buf);
   #endif
 
   if (s_fb.uvc_fb.len > UVC_MAX_FRAMESIZE_SIZE)
@@ -141,6 +150,22 @@ esp_err_t UVCStreamManager::setup()
    if (UVCStreamHelpers::frame_ready_sem == nullptr)
    {
      ESP_LOGE(UVC_STREAM_TAG, "Failed to create frame ready semaphore");
+     return ESP_FAIL;
+   }
+
+   // Frame buffers in PSRAM, allocated once — no per-frame heap churn
+   UVCStreamHelpers::uvc_frame_buf = static_cast<uint8_t *>(
+       heap_caps_malloc(UVC_MAX_FRAMESIZE_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+   for (int i = 0; i < 2; i++)
+   {
+     UVCStreamHelpers::jpeg_pp[i].buf = static_cast<uint8_t *>(
+         heap_caps_malloc(UVC_MAX_FRAMESIZE_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+     UVCStreamHelpers::jpeg_pp[i].len = 0;
+   }
+   if (!UVCStreamHelpers::uvc_frame_buf ||
+       !UVCStreamHelpers::jpeg_pp[0].buf || !UVCStreamHelpers::jpeg_pp[1].buf)
+   {
+     ESP_LOGE(UVC_STREAM_TAG, "Failed to allocate UVC frame buffers in PSRAM");
      return ESP_FAIL;
    }
    #endif
@@ -190,27 +215,18 @@ void UVCStreamManager::provide_jpeg_frame(uint8_t *jpeg_data, size_t jpeg_len)
     return;
   }
 
-  // Allocate and copy JPEG data into a new buffer BEFORE updating shared state
-  uint8_t *new_buf = (uint8_t *)malloc(jpeg_len);
-  if (!new_buf)
+  // Write the back buffer of the ping-pong pair, then flip. Readers only
+  // ever touch the front buffer, so no allocation or locking is needed.
+  const int back = 1 - UVCStreamHelpers::jpeg_front;
+  if (!UVCStreamHelpers::jpeg_pp[back].buf)
   {
-    ESP_LOGE(UVC_STREAM_TAG, "Failed to allocate memory for JPEG frame");
-    return;
+    return; // setup() failed or not run yet
   }
-  memcpy(new_buf, jpeg_data, jpeg_len);
+  memcpy(UVCStreamHelpers::jpeg_pp[back].buf, jpeg_data, jpeg_len);
+  UVCStreamHelpers::jpeg_pp[back].len = jpeg_len;
+  UVCStreamHelpers::jpeg_front = back;
 
-  // Free any previously allocated buffer and update shared state atomically
-  if (UVCStreamHelpers::jpeg_s_fb.buf != nullptr)
-  {
-    free(UVCStreamHelpers::jpeg_s_fb.buf);
-  }
-  UVCStreamHelpers::jpeg_s_fb.buf = new_buf;
-  UVCStreamHelpers::jpeg_s_fb.len = jpeg_len;
-
-  ESP_LOGI(UVC_STREAM_TAG, "Submitted JPEG frame (%zu bytes)", jpeg_len);
-  ESP_LOGI(UVC_STREAM_TAG, "JPEG sanity: SOI=0x%02X%02X EOI=0x%02X%02X",
-           new_buf[0], new_buf[1],
-           new_buf[jpeg_len - 2], new_buf[jpeg_len - 1]);
+  ESP_LOGD(UVC_STREAM_TAG, "Submitted JPEG frame (%zu bytes)", jpeg_len);
 
   // Signal that a frame is ready
   xSemaphoreGive(UVCStreamHelpers::frame_ready_sem);
