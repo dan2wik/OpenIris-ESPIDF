@@ -1,14 +1,4 @@
 dependencies:
-  espressif/cmake_utilities:
-    component_hash: 05165f30922b422b4b90c08845e6d449329b97370fbd06309803d8cb539d79e3
-    dependencies:
-    - name: idf
-      require: private
-      version: '>=4.1'
-    source:
-      registry_url: https://components.espressif.com
-      type: service
-    version: 1.1.1
   espressif/esp32-camera:
     component_hash: 2b75f6f0c987fb0e3687ccbd464cd00c163ea8cb05d2470cfb05adf6535bc488
     dependencies:
@@ -67,28 +57,6 @@ dependencies:
     - esp32s3
     - esp32p4
     version: 0.15.0~10
-  espressif/usb_device_uvc:
-    component_hash: f86ee44e64f3914474919a14ac4d47082d6a2888a62c239e6e9dc58c32da4682
-    dependencies:
-    - name: espressif/cmake_utilities
-      registry_url: https://components.espressif.com
-      require: private
-      version: '*'
-    - name: espressif/tinyusb
-      registry_url: https://components.espressif.com
-      require: private
-      version: '>=0.15.0~10'
-    - name: idf
-      require: private
-      version: '>=5.0'
-    source:
-      registry_url: https://components.espressif.com/
-      type: service
-    targets:
-    - esp32s2
-    - esp32s3
-    - esp32p4
-    version: 1.1.0
   idf:
     source:
       type: idf
@@ -98,8 +66,7 @@ direct_dependencies:
 - espressif/led_strip
 - espressif/mdns
 - espressif/tinyusb
-- espressif/usb_device_uvc
 - idf
-manifest_hash: ce79f51f937b9ae20c828fa8bea79f48130fe6bf5b524439da5fe53d73368007
+manifest_hash: 0eb170bd0468f2b850a779a297a8ff9b80088542ed199e65d0b58c6edfac39b3
 target: esp32s3
 version: 2.0.0

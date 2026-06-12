@@ -1,0 +1,6 @@
+description: Local override of espressif/usb_device_uvc 1.1.0 with a CDC-ACM serial interface added to the composite device
+dependencies:
+  espressif/tinyusb:
+    version: '>=0.15.0~10'
+  idf:
+    version: '>=5.0'

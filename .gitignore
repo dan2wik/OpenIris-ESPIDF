@@ -98,3 +98,5 @@ sdkconfig
 # Ignore all local history of files
 .history
 .ionide
+build_*/
+sdkconfig.zip

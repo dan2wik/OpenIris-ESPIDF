@@ -1,0 +1,146 @@
+{
+    // Two independent board configs:
+    //   TX = Project Babble camera  -> sdkconfig.tx, build_tx, COM22
+    //   RX = XIAO ESP32-S3 dongle   -> sdkconfig.rx, build_rx, COM24 (runtime CDC: COM3)
+    // Status bar buttons are provided by the actboy168.tasks extension, which
+    // reads the per-task "options.statusbar" blocks below.
+    // Each task runs in its own dedicated terminal that stays open after the
+    // task ends, so errors remain visible and your own terminal is untouched.
+    "version": "2.0.0",
+    "options": {
+        "shell": {
+            "executable": "powershell.exe",
+            "args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]
+        }
+    },
+    "tasks": [
+        {
+            "label": "Build TX (Babble)",
+            "type": "shell",
+            "command": ". C:\\Espressif\\tools\\Microsoft.v5.5.4.PowerShell_profile.ps1; idf.py -B build_tx -D SDKCONFIG='${workspaceFolder}\\sdkconfig.tx' build",
+            "problemMatcher": [],
+            "group": "build",
+            "presentation": {
+                "panel": "dedicated",
+                "reveal": "always",
+                "focus": false,
+                "showReuseMessage": false,
+                "clear": true,
+                "close": false
+            },
+            "options": {
+                "statusbar": {
+                    "label": "$(tools) TX",
+                    "tooltip": "Build TX (Babble camera)"
+                }
+            }
+        },
+        {
+            "label": "Flash TX (Babble -> COM22)",
+            "type": "shell",
+            "command": "& '${workspaceFolder}\\scripts\\flash-tx.ps1'",
+            "problemMatcher": [],
+            "group": "build",
+            "presentation": {
+                "panel": "dedicated",
+                "reveal": "always",
+                "focus": false,
+                "showReuseMessage": false,
+                "clear": true,
+                "close": false
+            },
+            "options": {
+                "statusbar": {
+                    "label": "$(zap) TX COM22",
+                    "tooltip": "Build + flash Babble camera on COM22",
+                    "color": "#ffcc66"
+                }
+            }
+        },
+        {
+            "label": "Monitor TX (COM22)",
+            "type": "shell",
+            "command": ". C:\\Espressif\\tools\\Microsoft.v5.5.4.PowerShell_profile.ps1; idf.py -B build_tx -p COM22 monitor",
+            "problemMatcher": [],
+            "isBackground": true,
+            "presentation": {
+                "panel": "dedicated",
+                "reveal": "always",
+                "focus": true,
+                "showReuseMessage": false,
+                "clear": true,
+                "close": false
+            },
+            "options": {
+                "statusbar": {
+                    "label": "$(terminal) TX",
+                    "tooltip": "Serial monitor: Babble camera (COM22)"
+                }
+            }
+        },
+        {
+            "label": "Build RX (XIAO dongle)",
+            "type": "shell",
+            "command": ". C:\\Espressif\\tools\\Microsoft.v5.5.4.PowerShell_profile.ps1; idf.py -B build_rx -D SDKCONFIG='${workspaceFolder}\\sdkconfig.rx' '-DSDKCONFIG_DEFAULTS=sdkconfig.base_defaults;sdkconfig.board.xiao-esp32s3;sdkconfig.rx_defaults' build",
+            "problemMatcher": [],
+            "group": "build",
+            "presentation": {
+                "panel": "dedicated",
+                "reveal": "always",
+                "focus": false,
+                "showReuseMessage": false,
+                "clear": true,
+                "close": false
+            },
+            "options": {
+                "statusbar": {
+                    "label": "$(tools) RX",
+                    "tooltip": "Build RX (XIAO dongle)"
+                }
+            }
+        },
+        {
+            "label": "Flash RX (XIAO -> COM24)",
+            "type": "shell",
+            "command": "& '${workspaceFolder}\\scripts\\flash-rx.ps1'",
+            "problemMatcher": [],
+            "group": "build",
+            "presentation": {
+                "panel": "dedicated",
+                "reveal": "always",
+                "focus": false,
+                "showReuseMessage": false,
+                "clear": true,
+                "close": false
+            },
+            "options": {
+                "statusbar": {
+                    "label": "$(zap) RX COM24",
+                    "tooltip": "Build + flash XIAO dongle on COM24 (auto-triggers bootloader via COM3)",
+                    "color": "#66ccff"
+                }
+            }
+        },
+        {
+            "label": "Monitor RX (COM3)",
+            "type": "shell",
+            "command": ". C:\\Espressif\\tools\\Microsoft.v5.5.4.PowerShell_profile.ps1; idf.py -B build_rx -p COM3 monitor",
+            "problemMatcher": [],
+            "isBackground": true,
+            "presentation": {
+                "panel": "dedicated",
+                "reveal": "always",
+                "focus": true,
+                "showReuseMessage": false,
+                "clear": true,
+                "close": false
+            },
+            "options": {
+                "statusbar": {
+                    "label": "$(terminal) RX",
+                    "tooltip": "Serial monitor: XIAO dongle runtime CDC (COM3)"
+                }
+            }
+        }
+    ]
+}
