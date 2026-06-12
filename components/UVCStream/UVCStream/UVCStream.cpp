@@ -43,6 +43,26 @@ extern "C"
 // single definition of shared framebuffer storage
 UVCStreamHelpers::fb_t UVCStreamHelpers::s_fb = {};
 
+#ifdef CONFIG_OISTREAM_RX_MODE
+// 802.11 RX dongle: injected-frame ping-pong (PSRAM). The StreamReceiver's
+// decode task writes the back buffer and flips the front index after the
+// copy completes; the UVC layer copies the front buffer into its own
+// transfer buffer immediately, so the next flip cannot tear it.
+#include "esp_heap_caps.h"
+namespace
+{
+struct jpeg_pp_t
+{
+    uint8_t* buf;
+    size_t len;
+};
+jpeg_pp_t s_jpeg_pp[2] = {};
+volatile int s_jpeg_front = 0;
+volatile bool s_jpeg_fresh = false;
+uint16_t s_rx_width = 240, s_rx_height = 240;
+}  // namespace
+#endif
+
 static esp_err_t UVCStreamHelpers::camera_start_cb(uvc_format_t format, int width, int height, int rate, void* cb_ctx)
 {
     ESP_LOGI(UVC_STREAM_TAG, "Camera Start");
@@ -65,7 +85,14 @@ static esp_err_t UVCStreamHelpers::camera_start_cb(uvc_format_t format, int widt
         return ESP_ERR_NOT_SUPPORTED;
     }
 
+#ifdef CONFIG_OISTREAM_RX_MODE
+    // No local camera — frames arrive over the 802.11 receiver
+    (void)frame_size;
+    s_rx_width = (uint16_t)width;
+    s_rx_height = (uint16_t)height;
+#else
     cameraHandler->setCameraResolution(frame_size);
+#endif
 
     SendStreamEvent(eventQueue, StreamState_e::Stream_ON);
 
@@ -113,6 +140,30 @@ static uvc_fb_t* UVCStreamHelpers::camera_fb_get_cb(void* cb_ctx)
         return nullptr;  // host will poll again
     }
 
+#ifdef CONFIG_OISTREAM_RX_MODE
+    // Serve the freshest injected frame from the ping-pong front buffer.
+    // The UVC layer memcpys it into its transfer buffer right away, well
+    // before the writer could flip and reuse this buffer.
+    if (!s_jpeg_fresh)
+    {
+        return nullptr;
+    }
+    const int front = s_jpeg_front;
+    const size_t flen = s_jpeg_pp[front].len;
+    if (!s_jpeg_pp[front].buf || flen == 0)
+    {
+        return nullptr;
+    }
+    s_jpeg_fresh = false;
+    s_fb.cam_fb_p = nullptr;
+    s_fb.uvc_fb.buf = s_jpeg_pp[front].buf;
+    s_fb.uvc_fb.len = flen;
+    s_fb.uvc_fb.width = s_rx_width;
+    s_fb.uvc_fb.height = s_rx_height;
+    s_fb.uvc_fb.format = UVC_FORMAT_JPEG;
+    s_fb.uvc_fb.timestamp.tv_sec = now_us / 1000000;
+    s_fb.uvc_fb.timestamp.tv_usec = now_us % 1000000;
+#else
     // Acquire a fresh frame only when allowed and no frame in flight
     camera_fb_t* cam_fb = esp_camera_fb_get();
     if (!cam_fb)
@@ -127,13 +178,16 @@ static uvc_fb_t* UVCStreamHelpers::camera_fb_get_cb(void* cb_ctx)
     s_fb.uvc_fb.height = cam_fb->height;
     s_fb.uvc_fb.format = UVC_FORMAT_JPEG;
     s_fb.uvc_fb.timestamp = cam_fb->timestamp;
+#endif
 
     // Validate size fits into transfer buffer
     if (mgr && s_fb.uvc_fb.len > mgr->getUvcBufferSize())
     {
         ESP_LOGE(UVC_STREAM_TAG, "Frame size %d exceeds UVC buffer size %u", (int)s_fb.uvc_fb.len, (unsigned)mgr->getUvcBufferSize());
+#ifndef CONFIG_OISTREAM_RX_MODE
         esp_camera_fb_return(cam_fb);
         s_fb.cam_fb_p = nullptr;
+#endif
         return nullptr;
     }
 
@@ -176,6 +230,20 @@ esp_err_t UVCStreamManager::setup()
         return ESP_FAIL;
     }
 
+#ifdef CONFIG_OISTREAM_RX_MODE
+    // Injected-frame ping-pong buffers (PSRAM, allocated once)
+    for (auto& pp : s_jpeg_pp)
+    {
+        pp.buf = static_cast<uint8_t*>(heap_caps_malloc(UVC_MAX_FRAMESIZE_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        pp.len = 0;
+        if (!pp.buf)
+        {
+            ESP_LOGE(UVC_STREAM_TAG, "Allocating RX frame buffers in PSRAM failed");
+            return ESP_FAIL;
+        }
+    }
+#endif
+
     uvc_device_config_t config = {
         .uvc_buffer = uvc_buffer,
         .uvc_buffer_size = UVCStreamManager::UVC_MAX_FRAMESIZE_SIZE,
@@ -215,5 +283,26 @@ esp_err_t UVCStreamManager::start()
     // UVC device is already initialized in setup(), just log that we're starting
     return ESP_OK;
 }
+
+#ifdef CONFIG_OISTREAM_RX_MODE
+void UVCStreamManager::provide_jpeg_frame(uint8_t* jpeg_data, size_t jpeg_len)
+{
+    if (!jpeg_data || jpeg_len == 0 || jpeg_len > UVC_MAX_FRAMESIZE_SIZE)
+    {
+        return;
+    }
+    // Write the back buffer, then flip. Readers only touch the front buffer
+    // and copy it out immediately, so no locking is needed.
+    const int back = 1 - s_jpeg_front;
+    if (!s_jpeg_pp[back].buf)
+    {
+        return;  // setup() not run yet
+    }
+    memcpy(s_jpeg_pp[back].buf, jpeg_data, jpeg_len);
+    s_jpeg_pp[back].len = jpeg_len;
+    s_jpeg_front = back;
+    s_jpeg_fresh = true;
+}
+#endif
 
 #endif

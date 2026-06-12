@@ -66,6 +66,13 @@ class UVCStreamManager
     {
         return uvc_buffer_size;
     }
+
+#ifdef CONFIG_OISTREAM_RX_MODE
+    // 802.11 RX dongle mode: frames come from the StreamReceiver instead of
+    // a local camera. Copies the JPEG into an internal ping-pong buffer; the
+    // UVC callbacks serve from it.
+    void provide_jpeg_frame(uint8_t* jpeg_data, size_t jpeg_len);
+#endif
 };
 
 #endif  // UVCSTREAM_HPP

@@ -31,6 +31,13 @@
 #include <UVCStream.hpp>
 #endif
 
+#ifdef CONFIG_OISTREAM_TX_MODE
+#include <TXStream.hpp>
+#endif
+#ifdef CONFIG_OISTREAM_RX_MODE
+#include <StreamReceiver.hpp>
+#endif
+
 // defines to configure nlohmann-json for esp32
 #define JSON_NO_IO 1
 #define JSON_NOEXCEPTION 1
@@ -281,12 +288,31 @@ extern "C" void app_main(void)
 
     xTaskCreate(HandleLEDDisplayTask, "HandleLEDDisplayTask", 1024 * 2, ledManager.get(), 3, nullptr);
 
+#ifndef CONFIG_OISTREAM_RX_MODE
+    // The RX dongle has no camera attached
     cameraHandler->setupCamera();
+#endif
 
     // let's keep the serial manager running for the duration of the setup
     // we'll clean it up later if need be
     serialManager->setup();
     xTaskCreate(HandleSerialManagerTask, "HandleSerialManagerTask", 1024 * 6, serialManager, 1, &serialManagerHandle);
+
+#if defined(CONFIG_OISTREAM_TX_MODE)
+    // Dedicated 802.11 transmitter build: encode + inject the camera stream,
+    // adapt from dongle feedback. Replaces the runtime streaming modes.
+    ESP_LOGI("[MAIN]", "802.11 TX mode: streaming camera over raw WiFi broadcast (channel %d)", CONFIG_OISTREAM_WIFI_CHANNEL);
+    ESP_ERROR_CHECK(TXStream::begin());
+    TXStream::startTask();
+    return;
+#elif defined(CONFIG_OISTREAM_RX_MODE)
+    // Dedicated 802.11 receiver/dongle build: UVC + CDC composite fed by the
+    // promiscuous receiver. Replaces the runtime streaming modes.
+    ESP_LOGI("[MAIN]", "802.11 RX dongle mode (channel %d)", CONFIG_OISTREAM_WIFI_CHANNEL);
+    startWiredMode(true);
+    ESP_ERROR_CHECK(stream_receiver_begin([](uint8_t* frame, size_t len) { uvcStream.provide_jpeg_frame(frame, len); }));
+    return;
+#else
 
     StreamingMode mode = deviceConfig->getDeviceMode();
     if (mode == StreamingMode::UVC)
@@ -310,4 +336,5 @@ extern "C" void app_main(void)
         startWiFiMode();
         startSetupMode();
     }
+#endif  // OISTREAM modes
 }

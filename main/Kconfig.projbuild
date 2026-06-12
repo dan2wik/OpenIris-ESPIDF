@@ -194,6 +194,41 @@ menu "OpenIris: LED Configuration"
 
 endmenu
 
+menu "OpenIris: 802.11 Stream (TX camera / RX dongle)"
+
+    config OISTREAM_TX_MODE
+        bool "Transmit the camera stream over raw 802.11 broadcast"
+        default n
+        help
+            Dedicated transmitter build: JPEG frames are Reed-Solomon encoded
+            and injected as raw 802.11 broadcast data frames (no association,
+            no ACKs). A paired RX dongle reassembles them and presents a UVC
+            webcam. Link adaptation (TX power, FEC parity, PHY rate) is driven
+            by ESP-NOW feedback from the dongle. This replaces the normal
+            runtime streaming modes.
+
+    config OISTREAM_RX_MODE
+        bool "Receive an 802.11 camera stream (USB dongle build)"
+        default n
+        depends on !OISTREAM_TX_MODE
+        select GENERAL_INCLUDE_UVC_MODE
+        help
+            Dedicated receiver/dongle build: sniffs the transmitter's raw
+            802.11 broadcast stream in promiscuous mode, repairs losses with
+            the Reed-Solomon parity and feeds complete JPEG frames to the UVC
+            device. Broadcasts link-quality feedback over ESP-NOW. This
+            replaces the normal runtime streaming modes.
+
+    config OISTREAM_WIFI_CHANNEL
+        int "WiFi channel for the 802.11 stream"
+        depends on OISTREAM_TX_MODE || OISTREAM_RX_MODE
+        range 1 13
+        default 1
+        help
+            Must match between the transmitter and the dongle.
+
+endmenu
+
 menu "OpenIris: Monitoring"
 
     config MONITORING_LED_CURRENT
