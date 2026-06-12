@@ -1,0 +1,49 @@
+# RX dongle overlay (XIAO ESP32-S3): receives the 802.11 stream and presents
+# as a UVC webcam + CDC serial port. Applied on top of sdkconfig.base_defaults
+# and sdkconfig.board.xiao-esp32s3.
+
+CONFIG_RX_MODE=y
+# CONFIG_TX_MODE is not set
+CONFIG_WIRED_MODE=y
+
+# Must match the TX board's channel
+CONFIG_WIFI_CHANNEL=1
+
+# UVC: bulk transfers, MJPEG 240x240 (matches the babble camera stream)
+CONFIG_UVC_MODE_BULK_CAM1=y
+CONFIG_UVC_CAM1_MULTI_FRAMESIZE=y
+CONFIG_FORMAT_MJPEG_CAM1=y
+CONFIG_FRAMESIZE_QVGA=y
+CONFIG_UVC_CAM1_FRAMERATE=90
+CONFIG_UVC_CAM1_FRAMESIZE_WIDTH=240
+CONFIG_UVC_CAM1_FRAMESIZE_HEIGT=240
+CONFIG_UVC_MULTI_FRAME_WIDTH_1=240
+CONFIG_UVC_MULTI_FRAME_HEIGHT_1=240
+CONFIG_UVC_MULTI_FRAME_FPS_1=60
+CONFIG_UVC_MULTI_FRAME_WIDTH_2=240
+CONFIG_UVC_MULTI_FRAME_HEIGHT_2=240
+CONFIG_UVC_MULTI_FRAME_FPS_2=60
+CONFIG_UVC_MULTI_FRAME_WIDTH_3=240
+CONFIG_UVC_MULTI_FRAME_HEIGHT_3=240
+CONFIG_UVC_MULTI_FRAME_FPS_3=60
+
+# USB identity
+CONFIG_TUSB_MANUFACTURER="ETVR"
+CONFIG_TUSB_PRODUCT="OpenIris Camera"
+
+# Sniffer headroom: more RX buffers so packet bursts aren't dropped by the
+# driver (funded by moving the stream frame buffers to PSRAM)
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=24
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=64
+
+# Crash forensics: coredump to flash (partition exists in min_spiffs.csv);
+# combined with the TinyUSB heartbeat watchdog this captures USB wedges.
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=y
+
+# 160MHz CPU: power reduction. Validated by telemetry (67fps held, soak at
+# 240MHz was clean first). Revert to 240 if loss/incomplete rise at range.
+# CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240 is not set
+CONFIG_ESP32S3_DEFAULT_CPU_FREQ_160=y
